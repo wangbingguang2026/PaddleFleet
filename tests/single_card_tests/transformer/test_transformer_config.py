@@ -312,5 +312,80 @@ class TestGetAccessor(unittest.TestCase):
         self.assertEqual(cfg.get("definitely_not_a_field", 42), 42)
 
 
+@unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
+class TestPerTokenLossValidation(unittest.TestCase):
+    """calculate_per_token_loss rejects layouts whose token count is unhandled."""
+
+    def test_rejects_sequence_parallel(self):
+        # SP is silently dropped at tp=1, so use tp=2 to keep it on.
+        with self.assertRaisesRegex(ValueError, "sequence_parallel"):
+            _make_config(
+                calculate_per_token_loss=True,
+                tensor_model_parallel_size=2,
+                sequence_parallel=True,
+            )
+
+    def test_rejects_real_csa_indexer(self):
+        # 1 < ratio < 128 with csa_dense_mode=False is the condition under
+        # which csa_attention.py actually builds a CSAIndexer, and that path's
+        # per-token normalisation is not implemented.
+        with self.assertRaisesRegex(ValueError, "real CSA indexer"):
+            _make_config(
+                calculate_per_token_loss=True,
+                csa_compress_ratios=[4],
+                csa_dense_mode=False,
+            )
+        with self.assertRaisesRegex(ValueError, "real CSA indexer"):
+            _make_config(
+                calculate_per_token_loss=True, csa_compress_ratios=[-2, 4]
+            )
+
+    def test_accepts_all_mla_csa_compress_ratios(self):
+        _make_config(
+            calculate_per_token_loss=True, csa_compress_ratios=[-2, -2]
+        )
+
+    def test_rejects_use_erndata(self):
+        with self.assertRaisesRegex(ValueError, "use_erndata"):
+            _make_config(calculate_per_token_loss=True, use_erndata=True)
+
+    def test_rejects_pipeline_parallel(self):
+        for kwargs in (
+            {"pipeline_model_parallel_size": 2},
+            {
+                "pipeline_model_parallel_size": 2,
+                "virtual_pipeline_model_parallel_size": 2,
+            },
+        ):
+            with (
+                self.subTest(**kwargs),
+                self.assertRaisesRegex(ValueError, "pipeline parallel"),
+            ):
+                _make_config(calculate_per_token_loss=True, **kwargs)
+
+    def test_allows_hca_only_and_dsa_layers(self):
+        # 128 = HCA (no indexer), -2 = latent MQA/DSA (supported through
+        # TileLangCSAIndexerLossAutoScaler). This is the production layout.
+        cfg = _make_config(
+            calculate_per_token_loss=True,
+            csa_compress_ratios=[128, 128, -2],
+            csa_dense_mode=False,
+        )
+        self.assertTrue(cfg.calculate_per_token_loss)
+
+    def test_allows_csa_ratios_in_dense_mode(self):
+        # csa_dense_mode=True builds no CSA indexer at all, so any ratio passes.
+        cfg = _make_config(
+            calculate_per_token_loss=True,
+            csa_compress_ratios=[4, 128],
+            csa_dense_mode=True,
+        )
+        self.assertTrue(cfg.calculate_per_token_loss)
+
+    def test_plain_layout_accepted(self):
+        cfg = _make_config(calculate_per_token_loss=True)
+        self.assertTrue(cfg.calculate_per_token_loss)
+
+
 if __name__ == "__main__":
     unittest.main()

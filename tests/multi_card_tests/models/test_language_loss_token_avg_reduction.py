@@ -18,8 +18,11 @@ With ``log_global_token_avg_loss`` on, every training forward stashes this rank'
 raw ``(loss_sum, valid_tokens)`` in a class-level tracker; the trainer then calls
 ``consume_token_avg_loss``, which packs every head's terms into one float64
 ``all_reduce(SUM)`` and returns the global token-weighted loss ΣΣS/ΣΣn
-(matching Megatron ``lm_loss``). That collective is skipped when the world has
-a single rank, so a multi-card test is the only thing that can reach it.
+(matching Megatron ``lm_loss``). The switch is independent of
+``calculate_per_token_loss``, which only decides what
+``_reduce_loss_by_tokens`` returns for backprop. That collective is skipped
+when the world has a single rank, so a multi-card test is the only thing that
+can reach it.
 
 Topology: world_size=2, TP=1, PP=2 -- the plain (non parallel-cross-entropy)
 branch of ``forward_impl``. The two ranks get deterministic but *unequal* valid
@@ -46,14 +49,19 @@ BATCH_SIZE = 1
 VALID_PER_RANK = (3, 1)
 
 
-def _build_config():
-    """Minimal config for the plain TP=1 loss branch, with the feature on."""
+def _build_config(per_token=False, log_avg=True, pp=2):
+    """Minimal config for the plain TP=1 loss branch.
+
+    The two switches are independent, so each test turns on only the one it is
+    about: ``calculate_per_token_loss`` for the raw-sum forward,
+    ``log_global_token_avg_loss`` for the tracker / reduction.
+    """
     return TransformerConfig(
         hidden_size=64,
         num_attention_heads=4,
         use_cpu_initialization=True,
         tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=2,
+        pipeline_model_parallel_size=pp,
         sequence_parallel=False,
         params_dtype=paddle.float32,
         parallel_output=True,
@@ -61,7 +69,8 @@ def _build_config():
         attention_dropout=0.0,
         loss_subbatch_sequence_length=0,
         gpt_model_use_experimental_version=False,
-        log_global_token_avg_loss=True,
+        calculate_per_token_loss=per_token,
+        log_global_token_avg_loss=log_avg,
         init_method=functools.partial(paddle.nn.init.xavier_uniform_, gain=1.0),
         output_layer_init_method=functools.partial(
             paddle.nn.init.xavier_uniform_, gain=1.0
@@ -117,8 +126,14 @@ def _global_reference():
 
 
 def _forward_once():
-    """One real training forward on this rank: ``(loss, loss_sum, count)``."""
-    loss_fn = LanguageLoss(config=_build_config())
+    """One real training forward on this rank: ``(loss, loss_sum, count)``.
+
+    ``calculate_per_token_loss`` is unsupported under PP, so this runs with both
+    switches off; the tracker must stay empty -- that is the orthogonality
+    assertion in ``test_forward_returns_this_ranks_local_mean``. The per-token
+    raw-sum forward is covered at PP=1 in test_language_loss_per_token_reduction.
+    """
+    loss_fn = LanguageLoss(config=_build_config(per_token=False, log_avg=False))
     logits_np, labels_np = _local_inputs(Utils.rank)
     logits = paddle.to_tensor(logits_np, dtype="float32").cuda()
     labels = paddle.to_tensor(labels_np, dtype="int64").cuda()
@@ -127,22 +142,40 @@ def _forward_once():
     return loss, loss_sum, count
 
 
-def test_forward_accumulates_this_ranks_raw_terms():
-    """Display-only: the returned (backprop) value is still the local token
-    mean, while the raw, un-normalized (S, n) land in the tracker."""
+def _stash_local_terms():
+    """Feed this rank's numpy (S, n) into the tracker via the real
+    ``_reduce_loss_by_tokens``, with ``log_global_token_avg_loss`` on."""
+    loss_fn = LanguageLoss(config=_build_config(per_token=False, log_avg=True))
+    loss_sum, count = _numpy_masked_ce(*_local_inputs(Utils.rank))
+    loss_fn._reduce_loss_by_tokens(
+        paddle.to_tensor(loss_sum, dtype="float32"),
+        paddle.to_tensor(float(count), dtype="float32"),
+    )
+
+
+def test_forward_returns_this_ranks_local_mean():
+    """Without per-token loss the forward returns this rank's masked mean, and
+    neither the legacy (S, n) nor the per-token keys are written."""
     LanguageLoss.token_avg_tracker.clear()
     try:
         loss, loss_sum, count = _forward_once()
 
         assert count == VALID_PER_RANK[Utils.rank]
         np.testing.assert_allclose(loss, loss_sum / count, rtol=1e-5, atol=1e-6)
-        tracker = LanguageLoss.token_avg_tracker
-        np.testing.assert_allclose(
-            float(tracker["S"]), loss_sum, rtol=1e-5, atol=1e-6
-        )
-        assert float(tracker["n"]) == float(count)
+        assert LanguageLoss.token_avg_tracker == {}
     finally:
         LanguageLoss.token_avg_tracker.clear()
+
+
+def test_per_token_rejects_pipeline_parallel():
+    """calculate_per_token_loss is unsupported under PP, so the PP=2 config
+    must be rejected at construction instead of mis-scaling the loss."""
+    try:
+        _build_config(per_token=True, log_avg=False)
+    except ValueError as e:
+        assert "pipeline parallel" in str(e)
+    else:
+        raise AssertionError("calculate_per_token_loss + PP=2 was not rejected")
 
 
 def test_consume_all_reduces_both_ranks_into_sigma_s_over_sigma_n():
@@ -154,7 +187,7 @@ def test_consume_all_reduces_both_ranks_into_sigma_s_over_sigma_n():
     """
     LanguageLoss.token_avg_tracker.clear()
     try:
-        _forward_once()
+        _stash_local_terms()
 
         got = LanguageLoss.consume_token_avg_loss()["loss"]
         token_weighted, mean_of_means = _global_reference()
@@ -178,7 +211,7 @@ def test_second_consume_is_a_no_op_that_still_runs_in_lockstep():
     """
     LanguageLoss.token_avg_tracker.clear()
     try:
-        _forward_once()
+        _stash_local_terms()
 
         assert LanguageLoss.consume_token_avg_loss()["loss"] is not None
         assert LanguageLoss.consume_token_avg_loss()["loss"] is None
@@ -195,10 +228,10 @@ def test_mtp_head_reduces_in_lockstep_even_where_absent():
 
     LanguageLoss.token_avg_tracker.clear()
     try:
-        _forward_once()
+        _stash_local_terms()
         if Utils.rank == 0:
             with ll._token_avg_head_scope(ll._mtp_token_avg_prefix(0)):
-                _forward_once()
+                _stash_local_terms()
 
         got = LanguageLoss.consume_token_avg_loss(1)
         token_weighted, _ = _global_reference()
@@ -218,7 +251,8 @@ if __name__ == "__main__":
     Utils.initialize_model_parallel(
         tensor_parallel_size=1, pipeline_parallel_size=2
     )
-    test_forward_accumulates_this_ranks_raw_terms()
+    test_forward_returns_this_ranks_local_mean()
+    test_per_token_rejects_pipeline_parallel()
     test_consume_all_reduces_both_ranks_into_sigma_s_over_sigma_n()
     test_second_consume_is_a_no_op_that_still_runs_in_lockstep()
     test_mtp_head_reduces_in_lockstep_even_where_absent()

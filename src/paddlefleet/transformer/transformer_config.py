@@ -2449,6 +2449,60 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        # calculate_per_token_loss: reject layouts whose token count is not
+        # handled yet, instead of silently mis-scaling the loss.
+        if self.calculate_per_token_loss:
+            if self.sequence_parallel:
+                raise ValueError(
+                    "calculate_per_token_loss + sequence_parallel is unsupported: "
+                    "T_global counts TP-sharded labels but is not reduced over "
+                    "TP, so it would be ~tp times too small. Got "
+                    "calculate_per_token_loss=True, sequence_parallel="
+                    f"{self.sequence_parallel}."
+                )
+            # Not validated end to end yet; keep it off until it is.
+            if self.use_erndata:
+                raise ValueError(
+                    "calculate_per_token_loss + use_erndata is not validated "
+                    "yet. Got calculate_per_token_loss=True, use_erndata="
+                    f"{self.use_erndata}; set use_erndata=False."
+                )
+            # A real CSA indexer (``1 < ratio < 128`` with
+            # ``csa_dense_mode=False``, the construction condition at
+            # ``csa_attention.py:2869``) is served by ``FusedDSAIndexerLoss`` /
+            # the CSA-indexer losses, whose per-token normalization is not
+            # implemented. HCA-only (``128``), latent MQA/DSA (``-2``) and
+            # ``csa_dense_mode=True`` layouts are supported and pass. This
+            # subsumes (and replaces) the earlier "all -2" restriction.
+            if (
+                self.csa_compress_ratios is not None
+                and not self.csa_dense_mode
+                and any(1 < int(r) < 128 for r in self.csa_compress_ratios)
+            ):
+                raise ValueError(
+                    "calculate_per_token_loss + a real CSA indexer "
+                    "(1 < csa_compress_ratios < 128 with csa_dense_mode=False) "
+                    "is unsupported: that path uses FusedDSAIndexerLoss / "
+                    "CSA-indexer losses, whose per-token normalization is not "
+                    "implemented. Got calculate_per_token_loss=True, "
+                    f"csa_dense_mode={self.csa_dense_mode}, "
+                    f"csa_compress_ratios={self.csa_compress_ratios!r}."
+                )
+            if self.pipeline_model_parallel_size != 1:
+                raise ValueError(
+                    "calculate_per_token_loss + pipeline parallel is unsupported: "
+                    "the per-token loss/grad scaling is not wired into the PP "
+                    "schedule. Got calculate_per_token_loss=True, "
+                    "pipeline_model_parallel_size="
+                    f"{self.pipeline_model_parallel_size}."
+                )
+            vpp_size = self.virtual_pipeline_model_parallel_size
+            if vpp_size is not None and vpp_size != 1:
+                raise ValueError(
+                    "calculate_per_token_loss + virtual pipeline parallel is "
+                    "unsupported. Got calculate_per_token_loss=True, "
+                    f"virtual_pipeline_model_parallel_size={vpp_size}."
+                )
         # Validate DSpark topology and target layers.
         if dspark_layers_active(self):
             if int(getattr(self, "num_nextn_predict_layers", 0) or 0) != 0:
@@ -2481,6 +2535,7 @@ class TransformerConfig(ModelParallelConfig):
                         f"dspark_target_layer_ids entry {lid} is out of range "
                         f"[0, {n_layers})."
                     )
+
         # ``True`` predates the "hf" target and has always meant Megatron, so
         # canonicalize it to the explicit name; every falsy spelling collapses to
         # False. An unknown target raises rather than falling back to the default

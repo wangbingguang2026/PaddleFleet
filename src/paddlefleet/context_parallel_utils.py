@@ -560,10 +560,14 @@ class ContextParallelScatterOp(PyLayer):
     @staticmethod
     def backward(ctx, grad_output):
         if ctx.mode.startswith("contiguous"):
-            return all_gather_contiguous(
+            grad = all_gather_contiguous(
                 grad_output, group=ctx.group, axis=ctx.axis
             )
-        return all_gather_balance(grad_output, axis=ctx.axis, group=ctx.group)
+        else:
+            grad = all_gather_balance(
+                grad_output, axis=ctx.axis, group=ctx.group
+            )
+        return grad
 
 
 class ContextParallelGatherOp(PyLayer):

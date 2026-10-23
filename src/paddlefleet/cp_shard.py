@@ -140,7 +140,9 @@ def to_cp_local(x, config, axis=1):
     source = cp_shard_source(config)
     if source == "scatter":
         return ContextParallelScatterOp.apply(
-            x, axis=axis, mode=config.cp_balance_mode
+            x,
+            axis=axis,
+            mode=config.cp_balance_mode,
         )
     if source == "local":
         return extract_local_cp_chunks(
