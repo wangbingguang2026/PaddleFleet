@@ -54,6 +54,13 @@ try:
 except (ImportError, ModuleNotFoundError):
     MuonShardingOptimizer = None
 
+try:
+    from paddle.distributed.fleet.meta_optimizers.mixed_sharding_optimizer import (
+        MixedShardingOptimizer,
+    )
+except (ImportError, ModuleNotFoundError):  # pragma: no cover
+    MixedShardingOptimizer = None
+
 from paddle.distributed.fleet.meta_parallel import get_rng_state_tracker
 from paddle.distributed.fleet.meta_parallel.sharding.group_sharded_optimizer_stage2 import (
     GroupShardedOptimizerStage2,
@@ -1676,14 +1683,25 @@ def init_optimizer(optimizer, model_sharded_state_dict, state_dict_metadata):
     Args:
         optimizer: The optimizer instance to be initialized.
     """
-    optimizer_state_names = [
-        ".moment1_0",
-        ".moment2_0",
-        ".beta1_pow_acc_0",
-        ".beta2_pow_acc_0",
-        ".w_0",
-    ]
     inner_opt = getattr(optimizer, "_inner_opt", None)
+    # State suffixes come from the inner optimizer's optimizer_state_layout()
+    # when it has one, else the AdamW/Muon defaults.
+    _layout_fn = getattr(inner_opt, "optimizer_state_layout", None)
+    if callable(_layout_fn):
+        _l = _layout_fn()
+        optimizer_state_names = (
+            ["." + s for s in _l.get("vector", [])]
+            + ["." + s for s in _l.get("scalar", [])]
+            + [".w_0"]
+        )
+    else:
+        optimizer_state_names = [
+            ".moment1_0",
+            ".moment2_0",
+            ".beta1_pow_acc_0",
+            ".beta2_pow_acc_0",
+            ".w_0",
+        ]
     static_to_struct_mapping = {}
     model_sharded_state_dict = dict(sorted(model_sharded_state_dict.items()))
     for k, v in model_sharded_state_dict.items():
@@ -1757,9 +1775,7 @@ def init_optimizer(optimizer, model_sharded_state_dict, state_dict_metadata):
         )
         return
 
-    elif MuonShardingOptimizer is not None and isinstance(
-        inner_opt, MuonShardingOptimizer
-    ):
+    elif _is_mixed_sharding_shell(inner_opt):
         parameter_list = []
 
         # --- 1D params: build shard-sized slice params from FusedCommBuffer ---
@@ -2116,10 +2132,25 @@ def get_lr_ratio_fn(optimizer):
     return None
 
 
+# Tensor-wise + element-wise sharding shells; both share the same internal
+# layout (_comm_buffer_list / _params_2d_by_color / ...).
+_MIXED_SHARDING_SHELL_NAMES = (
+    "MuonShardingOptimizer",
+    "MixedShardingOptimizer",
+)
+
+
+def _is_mixed_sharding_shell(opt):
+    return any(
+        shell is not None and isinstance(opt, shell)
+        for shell in (MuonShardingOptimizer, MixedShardingOptimizer)
+    )
+
+
 def _is_muon_sharding_optimizer(optimizer):
     opt = optimizer
     while opt is not None:
-        if type(opt).__name__ == "MuonShardingOptimizer":
+        if type(opt).__name__ in _MIXED_SHARDING_SHELL_NAMES:
             return True
         opt = getattr(opt, "_inner_opt", None)
     return False
@@ -2128,7 +2159,7 @@ def _is_muon_sharding_optimizer(optimizer):
 def _unwrap_muon_sharding_optimizer(optimizer):
     opt = optimizer
     while opt is not None:
-        if type(opt).__name__ == "MuonShardingOptimizer":
+        if type(opt).__name__ in _MIXED_SHARDING_SHELL_NAMES:
             return opt
         opt = getattr(opt, "_inner_opt", None)
     return None
