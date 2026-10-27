@@ -1152,6 +1152,11 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
     view.language_hidden_size = decoder_hidden
     view._attn_implementation = "eager"
     view.hyperbody_context_token_id = config.hyperbody_context_token_id
+    # The encoder numbers its layers 0..N-1 like the decoder does, so internal
+    # medicine would otherwise write both regions' layer i into the same metric
+    # key (and the same cross-layer aggregate). The tag routes the encoder's
+    # metrics to ``<monitor>_enc/...``; see internal_medicine LayerId.
+    view.metric_layer_region = "enc"
     # This region is replicated across CP: every CP rank holds the whole
     # sequence, so its local sequence IS the global one. Anything that scales a
     # per-rank statistic by cp -- the aux-loss denominator, its probs gather --
