@@ -65,7 +65,7 @@ _ENCODER_GEOMETRY = {
 def _encoder_view(packed=False, **overrides):
     encoder_config = dict(_ENCODER_GEOMETRY, **overrides)
     if packed:
-        encoder_config["hyperencoder_attn_backend"] = "triton"
+        encoder_config["hyperencoder_attn_backend"] = "flashmask"
         encoder_config["hyperencoder_packed_decoder"] = True
     cfg = HyperBodyConfig(
         decoder_config=dict(_DECODER_GEOMETRY),
